@@ -45,5 +45,29 @@
     "República Popular China",
     "cultura china"
   ],
-  "update_interval": 30
+  "interests": [
+    "argentina",
+    "inteligencia artificial",
+    "geopolítica",
+    "tecnología",
+    "programación",
+    "ciencia",
+    "filosofía",
+    "historia",
+    "literatura",
+    "música",
+    "deportes",
+    "cine",
+    "arte",
+    "China",
+    "República Popular China",
+    "cultura china"
+  ],
+  "update_interval": 30,
+  "lm_api": "http://localhost:1234/v1/chat/completions",
+  "model_name": "deepseek/deepseek-r1-0528-qwen3-8b",
+  "max_tokens": 800,
+  "temperature": 0.7,
+  "stream": false,
+  "search_enabled": true
 }

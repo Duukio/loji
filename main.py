@@ -15,6 +15,18 @@ HEADERS = {"Content-Type": "application/json"}
 MODEL_NAME = "deepseek/deepseek-r1-0528-qwen3-8b"
 DUCK_API = "https://api.duckduckgo.com/"
 
+DEFAULT_CONFIG = {
+    "persona": "",
+    "interests": [],
+    "update_interval": 60,
+    "lm_api": LM_API,
+    "model_name": MODEL_NAME,
+    "max_tokens": 800,
+    "temperature": 0.7,
+    "stream": False,
+    "search_enabled": True,
+}
+
 # NUEVO: Variables globales para BLIP (cargan lazy)
 processor = None
 model = None
@@ -81,13 +93,25 @@ def save_memory(memory):
     with open("memory.json", "w", encoding="utf-8") as f:
         json.dump(memory, f, indent=2, ensure_ascii=False)
 
-def load_config():
+def load_settings():
     try:
         with open("config.json", "r", encoding="utf-8") as f:
             config = json.load(f)
-            return [{"role": "system", "content": config["persona"]}]
     except:
+        config = {}
+
+    normalized = DEFAULT_CONFIG.copy()
+    normalized.update(config)
+    if "intereses" in config and not config.get("interests"):
+        normalized["interests"] = config["intereses"]
+    return normalized
+
+def load_config():
+    config = load_settings()
+    persona = config.get("persona", "").strip()
+    if not persona:
         return []
+    return [{"role": "system", "content": persona}]
 
 def clear_memory():
     with open("memory.json", "w", encoding="utf-8") as f:
@@ -131,7 +155,9 @@ def contains_recent_keywords(text):
     ]
     return any(re.search(rf'\b{k}\b', text.lower()) for k in keywords)
 
-def should_search(prompt, memory):
+def should_search(prompt, memory, config):
+    if not config.get("search_enabled", True):
+        return False
     if contains_recent_keywords(prompt):
         return True
     for msg in reversed(memory):
@@ -202,10 +228,11 @@ def describe_image(image_url):
         print(f" Error procesando imagen {image_url}: {str(e)}")
         return "No pude describir la imagen (URL inválida o error de descarga)."
 
+IMAGE_URL_PATTERN = re.compile(r'https?://\S+\.(?:jpg|jpeg|png|gif|bmp|webp)\b', re.IGNORECASE)
+
 def has_image_url(text):
     # Regex para detectar URLs de imágenes comunes
-    pattern = r'https?://\S+\.(jpg|jpeg|png|gif|bmp|webp)\b'
-    return bool(re.search(pattern, text, re.IGNORECASE))
+    return bool(IMAGE_URL_PATTERN.search(text))
 
 # Función para actualización periódica
 def periodic_update(config):
@@ -217,7 +244,14 @@ def periodic_update(config):
             with open("config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)  # Recargar config por si cambia
         except:
-            config = {"interests": [], "update_interval": 60}
+            config = DEFAULT_CONFIG.copy()
+
+        normalized = DEFAULT_CONFIG.copy()
+        normalized.update(config)
+        if "intereses" in config and not config.get("interests"):
+            normalized["interests"] = config["intereses"]
+        interests = normalized.get("interests", [])
+        update_interval = normalized.get("update_interval", 60)
         
         for interest in interests[:3]:  # Limitar a 3 por ciclo para no sobrecargar (puedes ajustar)
             results = duck_search(interest)
@@ -233,15 +267,29 @@ def periodic_update(config):
         time.sleep(update_interval * 60)  # Sleep en segundos
 
 # ---- Generación con IA (actualizada con KB e imágenes) ----
+def safe_post(url, payload):
+    try:
+        response = requests.post(url, headers=HEADERS, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json(), None
+    except Exception as e:
+        return None, str(e)
+
+def extract_answer(payload):
+    try:
+        return payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
 def generate(prompt, memory, config):  # Agregué config como param
     search_results = None
-    if should_search(prompt, memory):
+    if should_search(prompt, memory, config):
         search_results = duck_search(prompt)
         if search_results and "No encontré" not in search_results[0]:
             prompt = (
                 f"CONTEXTO ACTUALIZADO (post-2023):\n"
                 + "\n".join(search_results)
-                + "\n\nCONOCIMIENTO BASE (pre-2023):\n[Modelo: {MODEL_NAME}]\n\n"
+                + f"\n\nCONOCIMIENTO BASE (pre-2023):\n[Modelo: {config.get('model_name', MODEL_NAME)}]\n\n"
                 + "Resume equilibrando las perspectivas según la ideología entre corchetes. "
                   "Aclara si hay diferencias significativas y cita las fuentes.\n\n"
                   f"Pregunta: {prompt}"
@@ -258,7 +306,7 @@ def generate(prompt, memory, config):  # Agregué config como param
 
     # NUEVO: Procesar imágenes si hay URLs en el prompt
     if has_image_url(prompt):
-        image_urls = re.findall(r'https?://\S+\.(jpg|jpeg|png|gif|bmp|webp)\b', prompt, re.IGNORECASE)
+        image_urls = [match.group(0) for match in IMAGE_URL_PATTERN.finditer(prompt)]
         for url in image_urls[:2]:  # Limitar a 2 imágenes por prompt para no sobrecargar
             desc = describe_image(url)
             prompt += f"\n\n[Descripción de imagen ({url}): {desc}]"
@@ -266,16 +314,17 @@ def generate(prompt, memory, config):  # Agregué config como param
 
     full_context = memory + [{"role": "user", "content": prompt}]
     data = {
-        "model": MODEL_NAME,
+        "model": config.get("model_name", MODEL_NAME),
         "messages": full_context,
-        "temperature": 0.7,
-        "max_tokens": 800,
-        "stream": False
+        "temperature": config.get("temperature", 0.7),
+        "max_tokens": config.get("max_tokens", 800),
+        "stream": config.get("stream", False)
     }
 
-    response = requests.post(LM_API, headers=HEADERS, json=data)
-    output = response.json()
-    answer = output["choices"][0]["message"]["content"]
+    output, error = safe_post(config.get("lm_api", LM_API), data)
+    answer = extract_answer(output) if output else None
+    if not answer:
+        return f"Lo siento, no pude obtener respuesta del modelo. Error: {error or 'respuesta inválida'}"
 
     memory.append({"role": "user", "content": prompt})
     memory.append({"role": "assistant", "content": answer})
@@ -290,11 +339,7 @@ def loji_console():
     print("Loji 1.3 ('/exit' para salir, '/clear' para borrar memoria, '/rate' para calificar respuesta)")
     
     # Cargar config para interests y interval
-    try:
-        with open("config.json", "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except:
-        config = {"interests": [], "update_interval": 60}
+    config = load_settings()
     
     memory = load_config() + load_memory()
     
