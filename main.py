@@ -4,6 +4,9 @@ import re
 import datetime
 import threading  # Para hilos en segundo plano
 import time  # Para sleeps y timestamps
+import os
+import base64
+from urllib.parse import urlparse, unquote
 from io import BytesIO  # NUEVO: Para manejar bytes de imágenes descargadas
 from PIL import Image  # NUEVO: Para procesar imágenes
 import torch  # NUEVO: Para BLIP
@@ -214,25 +217,55 @@ def load_blip_model():
         model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
         print("BLIP listo.")
 
-def describe_image(image_url):
+def load_image_from_source(source):
+    if source.startswith("data:image/"):
+        header, encoded = source.split(",", 1)
+        return Image.open(BytesIO(base64.b64decode(encoded))).convert('RGB')
+    if source.startswith("file://"):
+        parsed = urlparse(source)
+        file_path = unquote(parsed.path)
+        if os.name == "nt" and file_path.startswith("/"):
+            file_path = file_path[1:]
+        return Image.open(file_path).convert('RGB')
+    if IMAGE_URL_PATTERN.match(source):
+        response = requests.get(source, timeout=10)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert('RGB')
+    file_path = os.path.expanduser(source)
+    if os.path.exists(file_path):
+        return Image.open(file_path).convert('RGB')
+    raise ValueError("Fuente de imagen no válida o inexistente")
+
+def describe_image(source):
     load_blip_model()
     try:
-        response = requests.get(image_url, timeout=10)
-        response.raise_for_status()
-        image = Image.open(BytesIO(response.content)).convert('RGB')
+        image = load_image_from_source(source)
         inputs = processor(image, return_tensors="pt")
         out = model.generate(**inputs, max_length=50, num_beams=5)  # Beam search para mejor caption
         caption = processor.decode(out[0], skip_special_tokens=True)
         return caption
     except Exception as e:
-        print(f" Error procesando imagen {image_url}: {str(e)}")
-        return "No pude describir la imagen (URL inválida o error de descarga)."
+        print(f" Error procesando imagen {source}: {str(e)}")
+        return "No pude describir la imagen (fuente inválida o error de lectura)."
 
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
 IMAGE_URL_PATTERN = re.compile(r'https?://\S+\.(?:jpg|jpeg|png|gif|bmp|webp)\b', re.IGNORECASE)
+IMAGE_DATA_PATTERN = re.compile(r'data:image/(?:jpg|jpeg|png|gif|bmp|webp);base64,[A-Za-z0-9+/=]+', re.IGNORECASE)
 
-def has_image_url(text):
-    # Regex para detectar URLs de imágenes comunes
-    return bool(IMAGE_URL_PATTERN.search(text))
+def extract_image_sources(text):
+    sources = []
+    sources.extend(match.group(0) for match in IMAGE_DATA_PATTERN.finditer(text))
+    sources.extend(match.group(0) for match in IMAGE_URL_PATTERN.finditer(text))
+    tokens = re.split(r"\s+", text)
+    for token in tokens:
+        cleaned = token.strip("\"'()[]{}<>,")
+        if not cleaned or cleaned.startswith("http") or cleaned.startswith("data:image/"):
+            continue
+        if cleaned.lower().endswith(IMAGE_EXTENSIONS):
+            path = os.path.expanduser(cleaned)
+            if os.path.exists(path):
+                sources.append(cleaned)
+    return list(dict.fromkeys(sources))
 
 # Función para actualización periódica
 def periodic_update(config):
@@ -304,12 +337,12 @@ def generate(prompt, memory, config):  # Agregué config como param
     if relevant_kb:
         prompt += f"\n\nCONOCIMIENTO RELEVANTE DE KB (actualizado): {chr(10).join(relevant_kb[:2])}"  # Limitar a 2
 
-    # NUEVO: Procesar imágenes si hay URLs en el prompt
-    if has_image_url(prompt):
-        image_urls = [match.group(0) for match in IMAGE_URL_PATTERN.finditer(prompt)]
-        for url in image_urls[:2]:  # Limitar a 2 imágenes por prompt para no sobrecargar
-            desc = describe_image(url)
-            prompt += f"\n\n[Descripción de imagen ({url}): {desc}]"
+    # NUEVO: Procesar imágenes si hay fuentes válidas en el prompt (URL, data URI o archivo local)
+    image_sources = extract_image_sources(prompt)
+    if image_sources:
+        for source in image_sources[:2]:  # Limitar a 2 imágenes por prompt para no sobrecargar
+            desc = describe_image(source)
+            prompt += f"\n\n[Descripción de imagen ({source}): {desc}]"
             print(f"🖼️ Imagen procesada: {desc}")
 
     full_context = memory + [{"role": "user", "content": prompt}]
