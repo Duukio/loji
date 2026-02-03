@@ -4,6 +4,10 @@ import re
 import datetime
 import threading  # Para hilos en segundo plano
 import time  # Para sleeps y timestamps
+import os
+import base64
+import random
+from urllib.parse import urlparse, unquote
 from io import BytesIO  # NUEVO: Para manejar bytes de imágenes descargadas
 from PIL import Image  # NUEVO: Para procesar imágenes
 import torch  # NUEVO: Para BLIP
@@ -13,7 +17,7 @@ from transformers import BlipProcessor, BlipForConditionalGeneration  # NUEVO: P
 LM_API = "http://localhost:1234/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json"}
 MODEL_NAME = "deepseek/deepseek-r1-0528-qwen3-8b"
-DUCK_API = "https://api.duckduckgo.com/"
+SEARXNG_API = "http://localhost:8080/search"
 
 DEFAULT_CONFIG = {
     "persona": "",
@@ -25,11 +29,18 @@ DEFAULT_CONFIG = {
     "temperature": 0.7,
     "stream": False,
     "search_enabled": True,
+    "searxng_api": SEARXNG_API,
+    "search_cache_ttl": 30,  # minutos
+    "knowledge_base_max_entries": 200,
+    "vision_enabled": True,
+    "search_backoff_base": 1.5,
+    "search_max_retries": 3,
 }
 
 # NUEVO: Variables globales para BLIP (cargan lazy)
 processor = None
 model = None
+search_cache = {}
 
 # Lista de fuentes confiables de distintos enfoques
 safe_sites = [
@@ -106,6 +117,10 @@ def load_settings():
         normalized["interests"] = config["intereses"]
     return normalized
 
+def save_settings(config):
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
 def load_config():
     config = load_settings()
     persona = config.get("persona", "").strip()
@@ -137,12 +152,15 @@ def clean_knowledge_base():
     kb = [entry for entry in kb if (now - datetime.datetime.fromisoformat(entry["timestamp"])).days < 30]
     save_knowledge_base(kb)
 
-def add_to_knowledge_base(entry):
+def add_to_knowledge_base(entry, config=None):
     kb = load_knowledge_base()
     # Verificar duplicado simple (por contenido)
     if not any(entry["content"] in existing["content"] for existing in kb):
         entry["timestamp"] = datetime.datetime.now().isoformat()
         kb.append(entry)
+        max_entries = (config or load_settings()).get("knowledge_base_max_entries", 200)
+        if max_entries and len(kb) > max_entries:
+            kb = kb[-max_entries:]
         save_knowledge_base(kb)
         print(f"Agregado a KB: {entry['query'][:50]}...")
 
@@ -171,33 +189,65 @@ def should_search(prompt, memory, config):
     ]
     return any(k in prompt.lower() for k in keywords)
 
-def duck_search(query):
+def read_search_cache(query, config):
+    ttl_minutes = config.get("search_cache_ttl", 30)
+    cached = search_cache.get(query.lower())
+    if not cached:
+        return None
+    timestamp, results = cached
+    if (time.time() - timestamp) / 60 <= ttl_minutes:
+        return results
+    search_cache.pop(query.lower(), None)
+    return None
+
+def write_search_cache(query, results):
+    search_cache[query.lower()] = (time.time(), results)
+
+def should_cache_result(results):
+    return results and "Error en búsqueda" not in results[0]
+
+def searxng_search(query, config, force_refresh=False):
+    if not force_refresh:
+        cached = read_search_cache(query, config)
+        if cached:
+            return cached
+
     site_filter = " OR ".join([f"site:{site}" for site in safe_sites])
     params = {
         "q": f"{query} ({site_filter}) -2020..2022",
-        "format": "json",
-        "no_html": 1,
-        "skip_disambig": 1
+        "format": "json"
     }
-    try:
-        resp = requests.get(DUCK_API, params=params, timeout=10)
-        data = resp.json()
-        results = []
+    base_backoff = config.get("search_backoff_base", 1.5)
+    max_retries = config.get("search_max_retries", 3)
+    api_url = config.get("searxng_api", SEARXNG_API)
+    last_error = None
 
-        if data.get("AbstractText"):
-            source = data.get("AbstractURL", "")
-            bias = detect_bias(source)
-            results.append(f"[{bias}] {data['AbstractText']} (Fuente: {source})")
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(api_url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results = []
+            for item in data.get("results", [])[:7]:
+                source = item.get("url", "")
+                if source and not any(site in source for site in safe_sites):
+                    continue
+                bias = detect_bias(source)
+                title = item.get("title") or ""
+                snippet = item.get("content") or item.get("snippet") or ""
+                if snippet or title:
+                    results.append(f"[{bias}] {title} {snippet} (Fuente: {source})".strip())
+            if not results:
+                results = ["No encontré información actualizada en las fuentes confiables definidas."]
+            if should_cache_result(results):
+                write_search_cache(query, results)
+            return results
+        except Exception as e:
+            last_error = e
+            sleep_for = base_backoff * (2 ** attempt) + random.uniform(0, 0.5)
+            time.sleep(sleep_for)
 
-        if data.get("RelatedTopics"):
-            for topic in data["RelatedTopics"][:5]:
-                if "Text" in topic and any(site in topic.get("FirstURL", "") for site in safe_sites):
-                    bias = detect_bias(topic.get("FirstURL", ""))
-                    results.append(f"[{bias}] {topic['Text']} (Fuente: {topic.get('FirstURL', '')})")
-
-        return results if results else ["No encontré información actualizada en las fuentes confiables definidas."]
-    except Exception as e:
-        return [f"Error en búsqueda: {str(e)}"]
+    return [f"Error en búsqueda: {str(last_error)}"]
 
 def detect_bias(url):
     for domain, bias in source_bias.items():
@@ -214,32 +264,62 @@ def load_blip_model():
         model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
         print("BLIP listo.")
 
-def describe_image(image_url):
+def load_image_from_source(source):
+    if source.startswith("data:image/"):
+        header, encoded = source.split(",", 1)
+        return Image.open(BytesIO(base64.b64decode(encoded))).convert('RGB')
+    if source.startswith("file://"):
+        parsed = urlparse(source)
+        file_path = unquote(parsed.path)
+        if os.name == "nt" and file_path.startswith("/"):
+            file_path = file_path[1:]
+        return Image.open(file_path).convert('RGB')
+    if IMAGE_URL_PATTERN.match(source):
+        response = requests.get(source, timeout=10)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert('RGB')
+    file_path = os.path.expanduser(source)
+    if os.path.exists(file_path):
+        return Image.open(file_path).convert('RGB')
+    raise ValueError("Fuente de imagen no válida o inexistente")
+
+def describe_image(source):
     load_blip_model()
     try:
-        response = requests.get(image_url, timeout=10)
-        response.raise_for_status()
-        image = Image.open(BytesIO(response.content)).convert('RGB')
+        image = load_image_from_source(source)
         inputs = processor(image, return_tensors="pt")
         out = model.generate(**inputs, max_length=50, num_beams=5)  # Beam search para mejor caption
         caption = processor.decode(out[0], skip_special_tokens=True)
         return caption
     except Exception as e:
-        print(f" Error procesando imagen {image_url}: {str(e)}")
-        return "No pude describir la imagen (URL inválida o error de descarga)."
+        print(f" Error procesando imagen {source}: {str(e)}")
+        return "No pude describir la imagen (fuente inválida o error de lectura)."
 
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
 IMAGE_URL_PATTERN = re.compile(r'https?://\S+\.(?:jpg|jpeg|png|gif|bmp|webp)\b', re.IGNORECASE)
+IMAGE_DATA_PATTERN = re.compile(r'data:image/(?:jpg|jpeg|png|gif|bmp|webp);base64,[A-Za-z0-9+/=]+', re.IGNORECASE)
 
-def has_image_url(text):
-    # Regex para detectar URLs de imágenes comunes
-    return bool(IMAGE_URL_PATTERN.search(text))
+def extract_image_sources(text):
+    sources = []
+    sources.extend(match.group(0) for match in IMAGE_DATA_PATTERN.finditer(text))
+    sources.extend(match.group(0) for match in IMAGE_URL_PATTERN.finditer(text))
+    tokens = re.split(r"\s+", text)
+    for token in tokens:
+        cleaned = token.strip("\"'()[]{}<>,")
+        if not cleaned or cleaned.startswith("http") or cleaned.startswith("data:image/"):
+            continue
+        if cleaned.lower().endswith(IMAGE_EXTENSIONS):
+            path = os.path.expanduser(cleaned)
+            if os.path.exists(path):
+                sources.append(cleaned)
+    return list(dict.fromkeys(sources))
 
 # Función para actualización periódica
 def periodic_update(config):
     interests = config.get("interests", [])
     update_interval = config.get("update_interval", 60)  # Minutos
     while True:  # Loop infinito en background
-        print(f"Iniciando actualización periódica (cada {update_interval} min)...")
+        print(f"⏱️  Iniciando actualización periódica (cada {update_interval} min)...")
         try:
             with open("config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)  # Recargar config por si cambia
@@ -254,16 +334,16 @@ def periodic_update(config):
         update_interval = normalized.get("update_interval", 60)
         
         for interest in interests[:3]:  # Limitar a 3 por ciclo para no sobrecargar (puedes ajustar)
-            results = duck_search(interest)
+            results = searxng_search(interest, normalized)
             if results and "No encontré" not in results[0]:
                 entry = {
                     "query": interest,
                     "content": "\n".join(results),
                     "sources": [r for r in results if "(Fuente:" in r]
                 }
-                add_to_knowledge_base(entry)
+                add_to_knowledge_base(entry, normalized)
         
-        print(f"Actualización completada. Esperando {update_interval} minutos...")
+        print(f"✅ Actualización completada. Esperando {update_interval} minutos...")
         time.sleep(update_interval * 60)  # Sleep en segundos
 
 # ---- Generación con IA (actualizada con KB e imágenes) ----
@@ -284,7 +364,7 @@ def extract_answer(payload):
 def generate(prompt, memory, config):  # Agregué config como param
     search_results = None
     if should_search(prompt, memory, config):
-        search_results = duck_search(prompt)
+        search_results = searxng_search(prompt, config)
         if search_results and "No encontré" not in search_results[0]:
             prompt = (
                 f"CONTEXTO ACTUALIZADO (post-2023):\n"
@@ -304,13 +384,14 @@ def generate(prompt, memory, config):  # Agregué config como param
     if relevant_kb:
         prompt += f"\n\nCONOCIMIENTO RELEVANTE DE KB (actualizado): {chr(10).join(relevant_kb[:2])}"  # Limitar a 2
 
-    # NUEVO: Procesar imágenes si hay URLs en el prompt
-    if has_image_url(prompt):
-        image_urls = [match.group(0) for match in IMAGE_URL_PATTERN.finditer(prompt)]
-        for url in image_urls[:2]:  # Limitar a 2 imágenes por prompt para no sobrecargar
-            desc = describe_image(url)
-            prompt += f"\n\n[Descripción de imagen ({url}): {desc}]"
-            print(f"🖼️ Imagen procesada: {desc}")
+    # NUEVO: Procesar imágenes si hay fuentes válidas en el prompt (URL, data URI o archivo local)
+    if config.get("vision_enabled", True):
+        image_sources = extract_image_sources(prompt)
+        if image_sources:
+            for source in image_sources[:2]:  # Limitar a 2 imágenes por prompt para no sobrecargar
+                desc = describe_image(source)
+                prompt += f"\n\n[Descripción de imagen ({source}): {desc}]"
+                print(f"🖼️ Imagen procesada: {desc}")
 
     full_context = memory + [{"role": "user", "content": prompt}]
     data = {
@@ -334,9 +415,10 @@ def generate(prompt, memory, config):  # Agregué config como param
 
     return answer
 
- #---- Consola (actualizada con /rate) ----
+ #---- Consola (actualizada con comandos útiles) ----
 def loji_console():
-    print("Loji 1.3 ('/exit' para salir, '/clear' para borrar memoria, '/rate' para calificar respuesta)")
+    print("Loji 1.4")
+    print("Escribe '/help' para ver comandos disponibles.")
     
     # Cargar config para interests y interval
     config = load_settings()
@@ -346,15 +428,92 @@ def loji_console():
     # Iniciar hilo de actualización en background
     update_thread = threading.Thread(target=periodic_update, args=(config,), daemon=True)
     update_thread.start()
-    print("Hilo de actualización iniciado (cada 60 min).")
+    print("✅ Hilo de actualización iniciado.")
+
+    def print_help():
+        print(
+            "\nComandos disponibles:\n"
+            "/help                → mostrar lista de comandos\n"
+            "/config              → ver config actual\n"
+            "/interests           → ver intereses\n"
+            "/interests set a,b   → reemplazar intereses\n"
+            "/interests add <t>   → agregar interés\n"
+            "/interests remove <t>→ quitar interés\n"
+            "/refresh <tema>      → forzar búsqueda ahora de ese interés\n"
+            "/vision on/off       → activar/desactivar BLIP\n"
+            "/rate buena|mala     → calificar respuesta\n"
+            "/clear               → borrar memoria\n"
+            "/exit                → salir\n"
+        )
 
     while True:
         user_input = input("Tú: ")
+        if user_input.lower() == "/help":
+            print_help()
+            continue
         if user_input.lower() == "/exit":
             break
         if user_input.lower() == "/clear":
             clear_memory()
             memory = load_config()
+            continue
+        if user_input.lower() == "/config":
+            print(json.dumps(config, indent=2, ensure_ascii=False))
+            continue
+        if user_input.lower().startswith("/vision"):
+            parts = user_input.split()
+            if len(parts) != 2 or parts[1].lower() not in ["on", "off"]:
+                print("Loji: Usa '/vision on' o '/vision off'.")
+                continue
+            config["vision_enabled"] = parts[1].lower() == "on"
+            save_settings(config)
+            status = "activado" if config["vision_enabled"] else "desactivado"
+            print(f"Loji: BLIP {status}.")
+            continue
+        if user_input.lower().startswith("/interests"):
+            parts = user_input.split(maxsplit=2)
+            if len(parts) == 1:
+                print(f"Intereses actuales: {', '.join(config.get('interests', [])) or 'ninguno'}")
+                continue
+            action = parts[1].lower()
+            value = parts[2].strip() if len(parts) > 2 else ""
+            if action == "set" and value:
+                config["interests"] = [v.strip() for v in value.split(",") if v.strip()]
+                save_settings(config)
+                print("Loji: Intereses actualizados.")
+                continue
+            if action == "add" and value:
+                interests = config.get("interests", [])
+                if value not in interests:
+                    interests.append(value)
+                config["interests"] = interests
+                save_settings(config)
+                print(f"Loji: Interés agregado: {value}")
+                continue
+            if action == "remove" and value:
+                config["interests"] = [i for i in config.get("interests", []) if i != value]
+                save_settings(config)
+                print(f"Loji: Interés eliminado: {value}")
+                continue
+            print("Loji: Usa '/interests', '/interests set a,b', '/interests add <t>' o '/interests remove <t>'.")
+            continue
+        if user_input.lower().startswith("/refresh"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                print("Loji: Usa '/refresh <tema>'.")
+                continue
+            topic = parts[1].strip()
+            results = searxng_search(topic, config, force_refresh=True)
+            if results and "No encontré" not in results[0]:
+                entry = {
+                    "query": topic,
+                    "content": "\n".join(results),
+                    "sources": [r for r in results if "(Fuente:" in r]
+                }
+                add_to_knowledge_base(entry, config)
+                print("Loji: Búsqueda actualizada en la base de conocimientos.")
+            else:
+                print("Loji: No encontré resultados nuevos.")
             continue
         if user_input.lower().startswith("/rate"):
             try:
@@ -367,7 +526,7 @@ def loji_console():
                 add_to_knowledge_base({
                     "query": "feedback",
                     "content": f"Calificación: {rating}, Pregunta: {last_query}, Respuesta: {last_response}"
-                })
+                }, config)
                 print(f"Loji: Gracias por calificar la respuesta como '{rating}'. ¡Guardado en la base de conocimientos!")
             except IndexError:
                 print("Loji: Por favor, usa '/rate buena' o '/rate mala'.")
