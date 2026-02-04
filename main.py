@@ -1,28 +1,28 @@
+from csv import reader
 import requests
 import json
 import re
 import datetime
-import threading  # Para hilos en segundo plano
-import time  # Para sleeps y timestamps
+import threading
+import time
 import os
 import base64
 import random
-from urllib.parse import urlparse, unquote
-import html as html_lib
+import easyocr
+from PIL import Image
+from io import BytesIO
 from urllib.parse import urlparse, unquote, parse_qs
-from io import BytesIO  # NUEVO: Para manejar bytes de imágenes descargadas
-from PIL import Image  # NUEVO: Para procesar imágenes
-import torch  # NUEVO: Para BLIP
-from transformers import BlipProcessor, BlipForConditionalGeneration  # NUEVO: Para BLIP
+
+#Inicialización de OCR
+ocr_reader = easyocr.Reader(['es', 'en'], gpu=False)
 
 # Configuración
-LM_API = "http://localhost:1234/v1/chat/completions"
+LM_API = "http://127.0.0.1:1234/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json"}
-MODEL_NAME = "deepseek/deepseek-r1-0528-qwen3-8b"
+MODEL_NAME = "local-model" 
 DUCKDUCKGO_API = "https://api.duckduckgo.com"
 last_llm_call = 0
 LLM_MIN_INTERVAL = 1.5
-
 
 DEFAULT_CONFIG = {
     "persona": "",
@@ -35,31 +35,19 @@ DEFAULT_CONFIG = {
     "stream": False,
     "search_enabled": True,
     "DUCKDUCKGO_API": DUCKDUCKGO_API,
-    "search_cache_ttl": 30,  # minutos
+    "search_cache_ttl": 30,
     "knowledge_base_max_entries": 200,
     "vision_enabled": True,
     "search_backoff_base": 1.5,
     "search_max_retries": 3,
 }
 
-# NUEVO: Variables globales para BLIP (cargan lazy)
-processor = None
-model = None
 search_cache = {}
 
-# Lista de fuentes confiables de distintos enfoques
 safe_sites = [
-    "reuters.com",
-    "theguardian.com",
-    "democracynow.org",
-    "eldiario.es",
-    "wsj.com",
-    "foxnews.com",
-    "dailymail.co.uk",
-    "infobae.com",
-    "abc.es",
-    "elmundo.es",
-    "elpais.com",
+    "reuters.com", "theguardian.com", "democracynow.org", "eldiario.es",
+    "wsj.com", "foxnews.com", "dailymail.co.uk", "infobae.com",
+    "abc.es", "elmundo.es", "elpais.com",
 ]
 
 source_bias = {
@@ -75,6 +63,8 @@ source_bias = {
     "elmundo.es": "centro-derecha",
     "elpais.com": "centro-izquierda",
 }
+
+
 
 def should_search(prompt, memory, config):
     if not config.get("search_enabled", True):
@@ -108,9 +98,6 @@ def write_search_cache(query, results):
 
 def should_cache_result(results):
     return results and "Error en búsqueda" not in results[0]
-
-def search_web(query, config, force_refresh=False):
-    return duckduckgo_search(query, config, force_refresh)
 
 def strip_html(text):
     return re.sub(r"<[^>]+>", "", text or "").strip()
@@ -152,13 +139,11 @@ def duckduckgo_search(query, config, force_refresh=False):
 
             results = []
 
-            # Abstract (respuesta instantánea si existe)
             if data.get("AbstractText"):
                 source = data.get("AbstractURL", "Sin fuente")
                 bias = detect_bias(source)
                 results.append(f"[{bias}] {data['AbstractText']} (Fuente: {source})")
 
-            # Related Topics (resultados relacionados)
             if data.get("RelatedTopics"):
                 for topic in data["RelatedTopics"][:6]:
                     if "Text" in topic:
@@ -189,11 +174,9 @@ def detect_bias(url):
             return bias
     return "desconocido"
 
-
 def contains_recent_keywords(prompt):
     keywords = ["hoy", "último", "actual", "noticia", "2024", "2025"]
     return any(k in prompt.lower() for k in keywords)
-
 
 def load_settings():
     try:
@@ -202,15 +185,17 @@ def load_settings():
     except:
         return DEFAULT_CONFIG.copy()
 
-
 def save_settings(config):
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-
 def load_config():
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    config = load_settings()
+    persona = config.get("persona", "")
+    if persona:
+        return [{"role": "system", "content": f"Eres {persona}. Fecha actual: {current_date}."}]
     return []
-
 
 def load_memory():
     try:
@@ -219,11 +204,13 @@ def load_memory():
     except:
         return []
 
-
 def clear_memory():
     with open("memory.json", "w", encoding="utf-8") as f:
         json.dump([], f)
 
+def save_memory(memory):
+    with open("memory.json", "w", encoding="utf-8") as f:
+        json.dump(memory, f, indent=2, ensure_ascii=False)
 
 def load_knowledge_base():
     try:
@@ -232,59 +219,163 @@ def load_knowledge_base():
     except:
         return []
 
-
 def add_to_knowledge_base(entry, config=None):
+    #¿Por que tuve que torturme haciendo una IA? 
     kb = load_knowledge_base()
+    
+    # Añadir timestamp si no existe
+    if "timestamp" not in entry:
+        entry["timestamp"] = time.time()
+    
+    # 1. Evitar duplicados EXACTOS (mismo query + mismo contenido)
+    new_query = entry.get("query", "").lower()
+    new_content_hash = hash(entry.get("content", ""))
+    
+    to_remove = []
+    for i, existing in enumerate(kb):
+        existing_query = existing.get("query", "").lower()
+        existing_content_hash = hash(existing.get("content", ""))
+        
+        #Elimina Duplicado exacto
+        if new_query == existing_query and new_content_hash == existing_content_hash:
+            print(f"[KB] Duplicado exacto ignorado: {new_query}")
+            return
+        
+        # Reemplazar si query es IDÉNTICO (no similar)
+        if new_query == existing_query:
+            to_remove.append(i)
+            print(f"[KB] Reemplazando entrada antigua: {new_query}")
+    
+    # Eliminar entradas a reemplazar (de atrás hacia adelante)
+    for i in sorted(to_remove, reverse=True):
+        del kb[i]
+    
+    # 2. Agregar nueva entrada
     kb.append(entry)
-    kb = kb[-DEFAULT_CONFIG["knowledge_base_max_entries"]:]
+    
+    # 3. Limpiar por tiempo (> 7 días)
+    max_age_days = 7
+    current_time = time.time()
+    kb = [e for e in kb if current_time - e.get("timestamp", 0) < max_age_days * 86400]
+    
+    # 4. Limitar por cantidad
+    max_entries = DEFAULT_CONFIG.get("knowledge_base_max_entries", 200)
+    if len(kb) > max_entries:
+        # Eliminar las más viejas primero
+        kb.sort(key=lambda x: x.get("timestamp", 0))
+        kb = kb[-max_entries:]
+    
+    # 5. Guardar
     with open("knowledge_base.json", "w", encoding="utf-8") as f:
         json.dump(kb, f, indent=2, ensure_ascii=False)
 
-
-def extract_image_sources(text):
-    return []
-
-
-def describe_image(source):
-    return "Visión no implementada"
-
-
-
-# Función para actualización periódica
 def periodic_update(config):
-    interests = config.get("interests", [])
-    update_interval = config.get("update_interval", 60)  # Minutos
-    while True:  # Loop infinito en background
-        print(f"Iniciando actualización periódica (cada {update_interval} min)...")
-        print(f"⏱️  Iniciando actualización periódica (cada {update_interval} min)...")
+    # Actualización periódica de datos según intereses del usuario.
+    update_interval = config.get("update_interval", 60)
+    while True:
+        print(f"⏱️ Iniciando actualización periódica (cada {update_interval} min)...")
+        
         try:
             with open("config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)  # Recargar config por si cambia
+                config = json.load(f)
         except:
             config = DEFAULT_CONFIG.copy()
-
-        normalized = DEFAULT_CONFIG.copy()
-        normalized.update(config)
-        if "intereses" in config and not config.get("interests"):
-            normalized["interests"] = config["intereses"]
-        interests = normalized.get("interests", [])
-        update_interval = normalized.get("update_interval", 60)
         
-        for interest in interests[:3]:  # Limitar a 3 por ciclo para no sobrecargar (puedes ajustar)
-            results = duckduckgo_search(interest, normalized)
+        interests = config.get("interests", [])
+        kb = load_knowledge_base()
+        
+        # Obtener intereses que NO han sido buscados recientemente
+        recent_queries = [entry.get("query", "").lower() for entry in kb[-5:]]  # Últimas 5
+        interests_to_update = []
+        
+        for interest in interests[:3]:  # Limitar a 3
+            if interest.lower() not in recent_queries:
+                interests_to_update.append(interest)
+            else:
+                print(f"[Update] Saltando '{interest}' - ya en KB reciente")
+        
+        # Solo buscar intereses NO recientes
+        for interest in interests_to_update:
+            print(f"[Update] Buscando: {interest}")
+            results = duckduckgo_search(interest, config)
             if results and "No encontré" not in results[0]:
                 entry = {
                     "query": interest,
                     "content": "\n".join(results),
-                    "sources": [r for r in results if "(Fuente:" in r]
+                    "sources": [r for r in results if "(Fuente:" in r],
+                    "timestamp": time.time()
                 }
-                add_to_knowledge_base(entry, normalized)
+                add_to_knowledge_base(entry, config)
+                print(f"[Update] Agregado: {interest}")
+            else:
+                print(f"[Update] Sin resultados nuevos para: {interest}")
         
-        print(f"Actualización completada. Esperando {update_interval} minutos...")
         print(f"✅ Actualización completada. Esperando {update_interval} minutos...")
-        time.sleep(update_interval * 60)  # Sleep en segundos
+        time.sleep(update_interval * 60)
 
-# ---- Generación con IA (actualizada con KB e imágenes) ----
+def extract_image_urls(text):
+    """Detecta más tipos de URLs de imágenes"""
+    # Patrón base
+    pattern1 = r'https?://[^\s<>"]+?\.(?:png|jpg|jpeg|gif|webp|bmp)(?:\?[^\s<>"]*)?'
+    
+    # Para Imgur (sin extensión)
+    pattern2 = r'https?://i\.imgur\.com/[a-zA-Z0-9]+(?:\.\w+)?'
+    
+    # Para otros CDNs comunes
+    pattern3 = r'https?://(?:cdn\.|media\.)[^\s]+\.(?:png|jpg|jpeg|gif)'
+    
+    all_patterns = f'({pattern1})|({pattern2})|({pattern3})'
+    
+    matches = re.findall(all_patterns, text, re.IGNORECASE)
+    
+    # Flatten y limpiar
+    urls = []
+    for match in matches:
+        for group in match:
+            if group:
+                urls.append(group)
+                break
+    
+    return list(set(urls))  # Eliminar duplicados
+
+def extract_text_from_image_url(image_url):
+    """Versión simplificada para Windows"""
+    try:
+        print(f"[OCR] Procesando imagen...")
+        
+        # Descarga SIMPLE (sin headers complicados)
+        response = requests.get(image_url, timeout=10)
+        
+        if response.status_code != 200:
+            return f"[Error HTTP {response.status_code}]"
+        
+        # Procesar imagen
+        img = Image.open(BytesIO(response.content))
+        
+        # OCR
+        results = ocr_reader.readtext(img, paragraph=True)
+        
+        if not results:
+            return "[Sin texto legible]"
+        
+        # Extraer textos con buena confianza
+        texts = []
+        for bbox, text, confidence in results:
+            if confidence > 0.3 and text.strip():
+                texts.append(text.strip())
+        
+        if not texts:
+            return "[Texto no claro]"
+        
+        full_text = " ".join(texts)
+        if len(full_text) > 500:
+            full_text = full_text[:500] + "..."
+        
+        return full_text
+        
+    except Exception as e:
+        return f"[Error: {type(e).__name__}]"
+
 def safe_post(url, payload):
     global last_llm_call
     wait = LLM_MIN_INTERVAL - (time.time() - last_llm_call)
@@ -294,12 +385,12 @@ def safe_post(url, payload):
     last_llm_call = time.time()
 
     try:
-        response = requests.post(url, headers=HEADERS, json=payload, timeout=60)
+        #Aumentar timeout para Qwen3-VL
+        response = requests.post(url, headers=HEADERS, json=payload, timeout=120)
         response.raise_for_status()
         return response.json(), None
     except Exception as e:
         return None, str(e)
-
 
 def extract_answer(payload):
     try:
@@ -307,26 +398,61 @@ def extract_answer(payload):
     except (KeyError, IndexError, TypeError):
         return None
 
-def generate(prompt, memory, config):
-    # Inyectar conocimiento relevante de KB
+def generate(user_prompt, memory, config):
+    
+    #Fecha y hora actual
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    date_info = f"hoy es {current_date}."
+    
+    if not any(msg["role"] == "system" and "Fecha actual" in msg["content"] for msg in memory):
+        memory.insert(0, {"role": "system", "content": f"Fecha actual: {date_info}"})
+    
+    # --- KB ---
     kb = load_knowledge_base()
     relevant_kb = []
-    for entry in kb[-5:]:  # Últimas 5 entradas para no sobrecargar
-        if any(keyword in prompt.lower() for keyword in entry["query"].split()):
+    user_words = set(user_prompt.lower().split())
+    
+    for entry in kb[-10:]:
+        entry_query = entry.get("query", "").lower()
+        entry_words = set(entry_query.split())
+        if user_words & entry_words:
             relevant_kb.append(entry["content"])
-    if relevant_kb:
-        prompt += f"\n\nCONOCIMIENTO RELEVANTE DE KB (actualizado): {chr(10).join(relevant_kb[:2])}"  # Limitar a 2
 
-    # NUEVO: Procesar imágenes si hay fuentes válidas en el prompt (URL, data URI o archivo local)
-    if config.get("vision_enabled", False):
-        image_source = extract_image_sources(prompt)
-        for source in image_source[:1]:  # Limitar a 1 imágen por prompt para no sobrecargar memoria
-            desc = describe_image(source)
-            prompt += f"\n\n[Descripción de imagen ({source}): {desc}]"
+    final_prompt = user_prompt
+    if relevant_kb:
+        final_prompt += (
+            "\n\n[CONOCIMIENTO RELEVANTE DE KB]:\n"
+            + "\n---\n".join(relevant_kb[:2])
+        )
+
+    # --- IMÁGENES CON OCR REAL ---
+    image_urls = extract_image_urls(user_prompt)
+    
+    if image_urls and config.get("vision_enabled", True):
+        print(f"\n🔍 [Loji] Detecté imagen: {image_urls[0][:50]}...")
+        
+        # EXTRAER TEXTO REAL CON OCR
+        ocr_result = extract_text_from_image_url(image_urls[0])
+        
+        if not ocr_result.startswith("[Error") and not ocr_result.startswith("[La imagen"):
+            # ✅ TEXTO EXTRAÍDO CON ÉXITO
+            final_prompt += f"\n\n[TEXTO EXTRAÍDO DE LA IMAGEN]:\n{ocr_result}"
+            print(f"✅ Texto extraído ({len(ocr_result)} caracteres)")
+            
+            # Reemplazar URL por marcador
+            final_prompt = final_prompt.replace(image_urls[0], "[IMAGEN]")
+        else:
+            # ❌ OCR FALLÓ
+            final_prompt += f"\n\n[Imagen detectada pero no contiene texto legible]"
+            print(f"⚠️  {ocr_result}")
+    
+    # --- LLM CALL ---
+    messages = memory.copy()
+    messages.append({"role": "user", "content": final_prompt})
 
     payload = {
-        "model": config.get("model_name", MODEL_NAME),
-        "messages": memory + [{"role": "user", "content": prompt}],
+        "model": config.get("model_name", "local-model"),
+        "messages": messages,
         "max_tokens": config.get("max_tokens", 800),
         "temperature": config.get("temperature", 0.7),
         "stream": False
@@ -340,23 +466,22 @@ def generate(prompt, memory, config):
     if not answer:
         return "No pude generar una respuesta."
 
-    memory.append({"role": "user", "content": prompt})
+    memory.append({"role": "user", "content": user_prompt})
     memory.append({"role": "assistant", "content": answer})
+    save_memory(memory)
 
     return answer
+
 def loji_console():
-    print("Loji 1.4")
+    print("Loji 1.5 - Asistente de IA con búsqueda web y visión por computadora")
     print("Escribe '/help' para ver comandos disponibles.")
     
-    # Cargar config para interests y interval
     config = load_settings()
-    
     memory = load_config() + load_memory()
     
-    # Iniciar hilo de actualización en background
+    # ✅ Solo un hilo de actualización
     update_thread = threading.Thread(target=periodic_update, args=(config,), daemon=True)
     update_thread.start()
-    print("Hilo de actualización iniciado (cada 60 min).")
     print("✅ Hilo de actualización iniciado.")
 
     def print_help():
@@ -369,7 +494,7 @@ def loji_console():
             "/interests add <t>   → agregar interés\n"
             "/interests remove <t>→ quitar interés\n"
             "/refresh <tema>      → forzar búsqueda ahora de ese interés\n"
-            "/vision on/off       → activar/desactivar BLIP\n"
+            "/vision on/off       → activar/desactivar Vision\n"
             "/rate buena|mala     → calificar respuesta\n"
             "/clear               → borrar memoria\n"
             "/exit                → salir\n"
@@ -397,7 +522,7 @@ def loji_console():
             config["vision_enabled"] = parts[1].lower() == "on"
             save_settings(config)
             status = "activado" if config["vision_enabled"] else "desactivado"
-            print(f"Loji: BLIP {status}.")
+            print(f"Loji: Visión {status}.")
             continue
         if user_input.lower().startswith("/interests"):
             parts = user_input.split(maxsplit=2)
@@ -437,7 +562,8 @@ def loji_console():
                 entry = {
                     "query": topic,
                     "content": "\n".join(results),
-                    "sources": [r for r in results if "(Fuente:" in r]
+                    "sources": [r for r in results if "(Fuente:" in r],
+                    "timestamp": time.time()
                 }
                 add_to_knowledge_base(entry, config)
                 print("Loji: Búsqueda actualizada en la base de conocimientos.")
@@ -453,15 +579,15 @@ def loji_console():
                 last_response = memory[-1]["content"] if memory and memory[-1]["role"] == "assistant" else "No hay respuesta previa."
                 last_query = memory[-2]["content"] if len(memory) >= 2 and memory[-2]["role"] == "user" else "No hay pregunta previa."
                 add_to_knowledge_base({
-                "query": "feedback",
-                "content": f"Calificación: {rating}, Pregunta: {last_query}, Respuesta: {last_response}"
+                    "query": "feedback",
+                    "content": f"Calificación: {rating}, Pregunta: {last_query}, Respuesta: {last_response}",
+                    "timestamp": time.time()
                 }, config)
-
-                print(f"Loji: Gracias por calificar la respuesta como '{rating}'. ¡Guardado en la base de conocimientos!")
+                print(f"Loji: Gracias por calificar la respuesta como '{rating}'.")
             except IndexError:
                 print("Loji: Por favor, usa '/rate buena' o '/rate mala'.")
             continue
-        reply = generate(user_input, memory, config)  # Pasar config
+        reply = generate(user_input, memory, config)
         print(f"Loji: {reply}\n")
 
 if __name__ == "__main__":
