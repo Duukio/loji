@@ -8,6 +8,8 @@ import os
 import base64
 import random
 from urllib.parse import urlparse, unquote
+import html as html_lib
+from urllib.parse import urlparse, unquote, parse_qs
 from io import BytesIO  # NUEVO: Para manejar bytes de imágenes descargadas
 from PIL import Image  # NUEVO: Para procesar imágenes
 import torch  # NUEVO: Para BLIP
@@ -17,7 +19,7 @@ from transformers import BlipProcessor, BlipForConditionalGeneration  # NUEVO: P
 LM_API = "http://localhost:1234/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json"}
 MODEL_NAME = "deepseek/deepseek-r1-0528-qwen3-8b"
-SEARXNG_API = "http://localhost:8080/search"
+DUCKDUCKGO_API = "https://api.duckduckgo.com"
 last_llm_call = 0
 LLM_MIN_INTERVAL = 1.5
 
@@ -32,7 +34,7 @@ DEFAULT_CONFIG = {
     "temperature": 0.7,
     "stream": False,
     "search_enabled": True,
-    "searxng_api": SEARXNG_API,
+    "DUCKDUCKGO_API": DUCKDUCKGO_API,
     "search_cache_ttl": 30,  # minutos
     "knowledge_base_max_entries": 200,
     "vision_enabled": True,
@@ -58,17 +60,10 @@ safe_sites = [
     "abc.es",
     "elmundo.es",
     "elpais.com",
-    "ambito.com",
-    "lanacion.com.ar",
-    "perfil.com",
-    "pagina12.com.ar",
-    "bbc.com",
-    "nytimes.com",
-    "clarin.com",
 ]
 
 source_bias = {
-    "reuters.com": "centro",
+    "reuters.com": "neutral",
     "theguardian.com": "izquierda",
     "democracynow.org": "izquierda",
     "eldiario.es": "izquierda",
@@ -79,95 +74,7 @@ source_bias = {
     "abc.es": "centro-derecha",
     "elmundo.es": "centro-derecha",
     "elpais.com": "centro-izquierda",
-    "ambito.com": "centro-derecha",
-    "Lanacion.com.ar": "centro-derecha",
-    "perfil.com": "centro-izquierda",
-    "pagina12.com.ar": "izquierda",
-    "bbc.com": "centro",
-    "nytimes.com": "centro-izquierda",
-    "clarin.com": "centro-derecha",
 }
-
-# ---- Memoria y Config ----
-def load_memory():
-    try:
-        with open("memory.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return []
-
-def save_memory(memory):
-    with open("memory.json", "w", encoding="utf-8") as f:
-        json.dump(memory, f, indent=2, ensure_ascii=False)
-
-def load_settings():
-    try:
-        with open("config.json", "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except:
-        config = {}
-
-    normalized = DEFAULT_CONFIG.copy()
-    normalized.update(config)
-    if "intereses" in config and not config.get("interests"):
-        normalized["interests"] = config["intereses"]
-    return normalized
-
-def save_settings(config):
-    with open("config.json", "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
-def load_config():
-    config = load_settings()
-    persona = config.get("persona", "").strip()
-    if not persona:
-        return []
-    return [{"role": "system", "content": persona}]
-
-def clear_memory():
-    with open("memory.json", "w", encoding="utf-8") as f:
-        json.dump([], f)
-    print("🗑 Memoria borrada.")
-
-# Funciones para Knowledge Base
-def load_knowledge_base():
-    try:
-        with open("knowledge_base.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return []
-
-def save_knowledge_base(kb):
-    with open("knowledge_base.json", "w", encoding="utf-8") as f:
-        json.dump(kb, f, indent=2, ensure_ascii=False)
-        
-
-def clean_knowledge_base():
-    kb = load_knowledge_base()
-    now = datetime.datetime.now()
-    kb = [entry for entry in kb if (now - datetime.datetime.fromisoformat(entry["timestamp"])).days < 30]
-    save_knowledge_base(kb)
-
-def add_to_knowledge_base(entry, config=None):
-    kb = load_knowledge_base()
-    # Verificar duplicado simple (por contenido)
-    if not any(entry["content"] in existing["content"] for existing in kb):
-        entry["timestamp"] = datetime.datetime.now().isoformat()
-        kb.append(entry)
-        max_entries = (config or load_settings()).get("knowledge_base_max_entries", 200)
-        if max_entries and len(kb) > max_entries:
-            kb = kb[-max_entries:]
-        save_knowledge_base(kb)
-        print(f"Agregado a KB: {entry['query'][:50]}...")
-
-# ---- Búsqueda balanceada ----
-def contains_recent_keywords(text):
-    current_year = datetime.datetime.now().year
-    keywords = [
-        "2023", str(current_year), "actual", "nuevo", "reciente",
-        "último", "ahora", "este año", "hoy día"
-    ]
-    return any(re.search(rf'\b{k}\b', text.lower()) for k in keywords)
 
 def should_search(prompt, memory, config):
     if not config.get("search_enabled", True):
@@ -202,49 +109,67 @@ def write_search_cache(query, results):
 def should_cache_result(results):
     return results and "Error en búsqueda" not in results[0]
 
-def searxng_search(query, config, force_refresh=False):
+def search_web(query, config, force_refresh=False):
+    return duckduckgo_search(query, config, force_refresh)
+
+def strip_html(text):
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+def normalize_duckduckgo_url(url):
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.netloc == "duckduckgo.com" and parsed.path == "/l/":
+        params = parse_qs(parsed.query)
+        redirected = params.get("uddg", [None])[0]
+        if redirected:
+            return unquote(redirected)
+    return url
+
+def duckduckgo_search(query, config, force_refresh=False):
     if not force_refresh:
         cached = read_search_cache(query, config)
         if cached:
             return cached
 
-    base_backoff = config.get("search_backoff_base", 1.5)
-    max_retries = config.get("search_max_retries", 3)
-    api_url = config.get("searxng_api", SEARXNG_API)
-
     params = {
-        "q": f"{query} actualidad análisis",
+        "q": query,
         "format": "json",
-        "no_html": 1,
-        "skip_disambig": 1,
-        "language": "es"
+        "no_html": "1",
+        "skip_disambig": "1",
+        "pretty": "1",
     }
 
+    base_backoff = config.get("search_backoff_base", 1.5)
+    max_retries = config.get("search_max_retries", 3)
     last_error = None
 
     for attempt in range(max_retries):
         try:
-            resp = requests.get(api_url, params=params, timeout=15)
+            resp = requests.get(DUCKDUCKGO_API, params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
 
             results = []
-            for item in data.get("results", [])[:7]:
-                source = item.get("url", "")
-                if not source or not any(site in source for site in safe_sites):
-                    continue
 
+            # Abstract (respuesta instantánea si existe)
+            if data.get("AbstractText"):
+                source = data.get("AbstractURL", "Sin fuente")
                 bias = detect_bias(source)
-                title = item.get("title") or ""
-                snippet = item.get("content") or item.get("snippet") or ""
+                results.append(f"[{bias}] {data['AbstractText']} (Fuente: {source})")
 
-                if title or snippet:
-                    results.append(
-                        f"[{bias}] {title} {snippet} (Fuente: {source})".strip()
-                    )
+            # Related Topics (resultados relacionados)
+            if data.get("RelatedTopics"):
+                for topic in data["RelatedTopics"][:6]:
+                    if "Text" in topic:
+                        url = topic.get("FirstURL", "")
+                        if url:
+                            bias = detect_bias(url)
+                            text = topic["Text"]
+                            results.append(f"[{bias}] {text} (Fuente: {url})")
 
             if not results:
-                results = ["No encontré información actualizada en fuentes confiables."]
+                results = ["No encontré información relevante en DuckDuckGo."]
 
             if should_cache_result(results):
                 write_search_cache(query, results)
@@ -253,10 +178,10 @@ def searxng_search(query, config, force_refresh=False):
 
         except Exception as e:
             last_error = e
-            time.sleep(base_backoff * (2 ** attempt) + random.uniform(0, 0.5))
+            sleep_time = base_backoff * (2 ** attempt) + random.uniform(0, 0.5)
+            time.sleep(sleep_time)
 
-    return [f"Error en búsqueda: {last_error}"]
-
+    return [f"Error en búsqueda tras {max_retries} intentos: {str(last_error)}"]
 
 def detect_bias(url):
     for domain, bias in source_bias.items():
@@ -264,66 +189,66 @@ def detect_bias(url):
             return bias
     return "desconocido"
 
-# NUEVO: Funciones para BLIP (reconocimiento de imágenes)
-def load_blip_model():
-    global processor, model
-    if processor is None:
-        print("Cargando modelo BLIP por primera vez (paciencia)...")
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-        print("BLIP listo.")
 
-def load_image_from_source(source):
-    if source.startswith("data:image/"):
-        header, encoded = source.split(",", 1)
-        return Image.open(BytesIO(base64.b64decode(encoded))).convert('RGB')
-    if source.startswith("file://"):
-        parsed = urlparse(source)
-        file_path = unquote(parsed.path)
-        if os.name == "nt" and file_path.startswith("/"):
-            file_path = file_path[1:]
-        return Image.open(file_path).convert('RGB')
-    if IMAGE_URL_PATTERN.match(source):
-        response = requests.get(source, timeout=10)
-        response.raise_for_status()
-        return Image.open(BytesIO(response.content)).convert('RGB')
-    file_path = os.path.expanduser(source)
-    if os.path.exists(file_path):
-        return Image.open(file_path).convert('RGB')
-    raise ValueError("Fuente de imagen no válida o inexistente")
+def contains_recent_keywords(prompt):
+    keywords = ["hoy", "último", "actual", "noticia", "2024", "2025"]
+    return any(k in prompt.lower() for k in keywords)
 
-def describe_image(source):
-    load_blip_model()
+
+def load_settings():
     try:
-        image = load_image_from_source(source)
-        inputs = processor(image, return_tensors="pt")
-        out = model.generate(**inputs, max_length=50, num_beams=5)
-        return processor.decode(out[0], skip_special_tokens=True)
-    except Exception as e:
-        print(f"🖼️ Error procesando imagen {source}: {e}")
-        return "No pude describir la imagen."
+        with open("config.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return DEFAULT_CONFIG.copy()
 
 
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
-IMAGE_URL_PATTERN = re.compile(r'https?://\S+\.(?:jpg|jpeg|png|gif|bmp|webp)\b', re.IGNORECASE)
-IMAGE_DATA_PATTERN = re.compile(r'data:image/[a-zA-Z0-9+/;=,]+', re.IGNORECASE)
+def save_settings(config):
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
 
+
+def load_config():
+    return []
+
+
+def load_memory():
+    try:
+        with open("memory.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def clear_memory():
+    with open("memory.json", "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+
+def load_knowledge_base():
+    try:
+        with open("knowledge_base.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def add_to_knowledge_base(entry, config=None):
+    kb = load_knowledge_base()
+    kb.append(entry)
+    kb = kb[-DEFAULT_CONFIG["knowledge_base_max_entries"]:]
+    with open("knowledge_base.json", "w", encoding="utf-8") as f:
+        json.dump(kb, f, indent=2, ensure_ascii=False)
 
 
 def extract_image_sources(text):
-    sources = []
-    sources.extend(match.group(0) for match in IMAGE_DATA_PATTERN.finditer(text))
-    sources.extend(match.group(0) for match in IMAGE_URL_PATTERN.finditer(text))
-    tokens = re.split(r"\s+", text)
-    for token in tokens:
-        cleaned = token.strip("\"'()[]{}<>,")
-        if not cleaned or cleaned.startswith("http") or cleaned.startswith("data:image/"):
-            continue
-        if cleaned.lower().endswith(IMAGE_EXTENSIONS):
-            path = os.path.expanduser(cleaned)
-            if os.path.exists(path):
-                sources.append(cleaned)
-    return list(dict.fromkeys(sources))
+    return []
+
+
+def describe_image(source):
+    return "Visión no implementada"
+
+
 
 # Función para actualización periódica
 def periodic_update(config):
@@ -346,7 +271,7 @@ def periodic_update(config):
         update_interval = normalized.get("update_interval", 60)
         
         for interest in interests[:3]:  # Limitar a 3 por ciclo para no sobrecargar (puedes ajustar)
-            results = searxng_search(interest, normalized)
+            results = duckduckgo_search(interest, normalized)
             if results and "No encontré" not in results[0]:
                 entry = {
                     "query": interest,
@@ -382,20 +307,7 @@ def extract_answer(payload):
     except (KeyError, IndexError, TypeError):
         return None
 
-def generate(prompt, memory, config):  # Agregué config como param
-    search_results = None
-    if should_search(prompt, memory, config):
-        search_results = searxng_search(prompt, config)
-        if search_results and "No encontré" not in search_results[0]:
-            prompt = (
-                f"CONTEXTO ACTUALIZADO (post-2023):\n"
-                + "\n".join(search_results)
-                + f"\n\nCONOCIMIENTO BASE (pre-2023):\n[Modelo: {config.get('model_name', MODEL_NAME)}]\n\n"
-                + "Resume equilibrando las perspectivas según la ideología entre corchetes. "
-                  "Aclara si hay diferencias significativas y cita las fuentes.\n\n"
-                  f"Pregunta: {prompt}"
-            )
-
+def generate(prompt, memory, config):
     # Inyectar conocimiento relevante de KB
     kb = load_knowledge_base()
     relevant_kb = []
@@ -406,36 +318,32 @@ def generate(prompt, memory, config):  # Agregué config como param
         prompt += f"\n\nCONOCIMIENTO RELEVANTE DE KB (actualizado): {chr(10).join(relevant_kb[:2])}"  # Limitar a 2
 
     # NUEVO: Procesar imágenes si hay fuentes válidas en el prompt (URL, data URI o archivo local)
-    if config.get ("vision_enabled", False):
-        image_source = extract_image_sources (prompt)
-        for source in image_source [:1]:  # Limitar a 1 imágen por prompt para no sobrecargar memoria
-            desc = describe_image (source)
+    if config.get("vision_enabled", False):
+        image_source = extract_image_sources(prompt)
+        for source in image_source[:1]:  # Limitar a 1 imágen por prompt para no sobrecargar memoria
+            desc = describe_image(source)
             prompt += f"\n\n[Descripción de imagen ({source}): {desc}]"
-            print (f"🖼️ Imagen procesada: {desc}")
-    full_context = memory + [{"role": "user", "content": prompt}]
-    data = {
+
+    payload = {
         "model": config.get("model_name", MODEL_NAME),
-        "messages": full_context,
-        "temperature": config.get("temperature", 0.7),
+        "messages": memory + [{"role": "user", "content": prompt}],
         "max_tokens": config.get("max_tokens", 800),
-        "stream": config.get("stream", False)
+        "temperature": config.get("temperature", 0.7),
+        "stream": False
     }
 
-    output, error = safe_post(config.get("lm_api", LM_API), data)
-    answer = extract_answer(output) if output else None
+    response, error = safe_post(config.get("lm_api", LM_API), payload)
+    if error:
+        return f"Error al contactar LLM: {error}"
+
+    answer = extract_answer(response)
     if not answer:
-        return f"Lo siento, no pude obtener respuesta del modelo. Error: {error or 'respuesta inválida'}"
+        return "No pude generar una respuesta."
 
     memory.append({"role": "user", "content": prompt})
     memory.append({"role": "assistant", "content": answer})
-    if search_results:
-        memory.append({"role": "system", "content": f"Datos de búsqueda (post-2023): {search_results}"})
-    save_memory(memory)
 
     return answer
-
- #---- Consola (actualizada con /rate) ----
- #---- Consola (actualizada con comandos útiles) ----
 def loji_console():
     print("Loji 1.4")
     print("Escribe '/help' para ver comandos disponibles.")
@@ -524,7 +432,7 @@ def loji_console():
                 print("Loji: Usa '/refresh <tema>'.")
                 continue
             topic = parts[1].strip()
-            results = searxng_search(topic, config, force_refresh=True)
+            results = duckduckgo_search(topic, config, force_refresh=True)
             if results and "No encontré" not in results[0]:
                 entry = {
                     "query": topic,
