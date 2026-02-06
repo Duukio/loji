@@ -30,18 +30,18 @@ DEFAULT_CONFIG = {
     "update_interval": 60,
     "lm_api": LM_API,
     "model_name": MODEL_NAME,
-    "max_tokens": 350,  
-    "temperature": 0.6, 
+    "max_tokens": 350,  # Era 800, ahora 350 (mejor para CPU)
+    "temperature": 0.6,  # Era 0.7, ahora 0.6 (más consistente)
     "stream": False,
     "search_enabled": True,
     "DUCKDUCKGO_API": DUCKDUCKGO_API,
-    "search_cache_ttl": 60,  
+    "search_cache_ttl": 60,  #Eran 30, ahora 60 (menos búsquedas)
     "knowledge_base_max_entries": 200,
     "vision_enabled": True,
     "search_backoff_base": 1.5,
     "search_max_retries": 3,
-    "enable_smart_continuation": True,  #Habilita continuación inteligente
-    "dynamic_tokens": True,  #  NUEVO: Ajusta tokens según tipo de pregunta
+    "enable_smart_continuation": True,  #NUEVO: Habilita continuación inteligente
+    "dynamic_tokens": True,  #Ajusta tokens según tipo de pregunta
 }
 
 search_cache = {}
@@ -79,9 +79,62 @@ def should_search(prompt, memory, config):
             if prompt.lower() in stored_data.lower():
                 return False
     keywords = [
-        "quién", "qué es", "cuándo", "dónde", "último",
-        "noticias", "precio", "definición", "significado", "actual"
+        "quién", "qué es", "cuándo", "dónde", "último", "última",
+        "noticias", "precio", "definición", "significado", "actual",
+        "qué pasó", "que paso", "qué fue de", "que fue de",
+        "noticia sobre", "últimas noticias", "reciente",
+        "renunció", "renuncio", "murió", "murio", "falleció"
     ]
+    
+    # Detectar preguntas sobre personas específicas (nombres propios)
+    # Patron: dos palabras capitalizadas juntas (ej: "Juan Pérez")
+    if re.search(r'\b[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\b', prompt):
+        # Lista AMPLIADA de action words
+        action_words = [
+            # Preguntas básicas
+            "es", "fue", "será", "sea", "son", "eran", "están", "estaba", "estuvo",
+            # Acciones pasadas
+            "hizo", "dijo", "anunció", "anuncio", "declaró", "declaro", "presentó", "presento",
+            "renunció", "renuncio", "dimitió", "dimiti", "asumió", "asumo", 
+            "ganó", "gano", "perdió", "perdio", "logró", "logro",
+            # Estados y cambios
+            "paso", "pasó", "pasa", "ocurrió", "ocurrio", "sucedió", "sucedio",
+            "murió", "murio", "falleció", "fallecio", "nació", "nacio",
+            # Acciones presentes/futuras
+            "hace", "trabaja", "dirige", "lidera", "encabeza", "maneja",
+            "sigue", "continúa", "continua", "mantiene",
+            # Eventos/Noticias
+            "pasó con", "paso con", "fue de", "fue del", "fue de la",
+            "noticia", "noticias", "información", "informacion", "dato", "datos",
+            # Cargos y posiciones
+            "director", "directora", "ministro", "ministra", "presidente", "presidenta",
+            "secretario", "secretaria", "jefe", "jefa", "titular", "cargo",
+            # Verbos de investigación
+            "investigó", "investigo", "descubrió", "descubrio", "reveló", "revelo",
+            "confirmó", "confirmo", "desmintió", "desmintio",
+            # Cambios de estado
+            "cambió", "cambio", "modificó", "modifico", "actualizó", "actualizo",
+            "reemplazó", "reemplazo", "sustituyó", "sustituyo", "dejó", "dejo",
+            # Acciones legales/políticas
+            "acusó", "acuso", "denunció", "denuncio", "demandó", "demando",
+            "condenó", "condeno", "absolvió", "absolvio", "procesó", "proceso",
+            # Verbos de comunicación
+            "comentó", "comento", "opinó", "opino", "criticó", "critico",
+            "defendió", "defendio", "apoyó", "apoyo", "rechazó", "rechazo",
+            # Otros verbos comunes
+            "llegó", "llego", "salió", "salio", "entró", "entro",
+            "viajó", "viajo", "visitó", "visito", "asistió", "asistio",
+            "participó", "participo", "organizó", "organizo",
+            # Verbos en infinitivo que pueden aparecer
+            "hacer", "decir", "tener", "estar", "ir", "venir", "dar", "poder",
+            # Frases completas comunes
+            "qué hace", "que hace", "a qué se dedica", "a que se dedica",
+            "dónde está", "donde esta", "dónde trabaja", "donde trabaja",
+            "cuál es su", "cual es su", "quién es", "quien es"
+        ]
+        if any(word in prompt.lower() for word in action_words):
+            return True
+    
     return any(k in prompt.lower() for k in keywords)
 
 def read_search_cache(query, config):
@@ -313,7 +366,7 @@ def extract_text_from_image_url(image_url):
     except Exception as e:
         return f"[Error: {type(e).__name__}]"
 
-#Detecta si una respuesta fue truncada
+# Detecta si una respuesta fue truncada
 def detect_truncation(text):
     """Detecta si una respuesta fue truncada a mitad de idea"""
     if not text or len(text.strip()) < 20:
@@ -346,7 +399,7 @@ def detect_truncation(text):
     
     return False
 
-#Ajusta el prompt para respuestas largas
+# Ajusta el prompt para respuestas largas
 def split_response_if_needed(prompt, config):
     """Modifica el prompt si se espera una respuesta larga"""
     if not config.get("enable_smart_continuation", True):
@@ -396,10 +449,8 @@ def safe_post(url, payload, max_tokens):
     last_llm_call = time.time()
 
     try:
-        # Timeout dinámico basado en tokens
-        # 0.15 segundos por token
-        estimated_time = max_tokens * 0.15
-        timeout = min(max(estimated_time, 30), 120)  # Entre 30 y 120 segundos
+        # Timeout conservador para CPU
+        timeout = 120 
         
         response = requests.post(url, headers=HEADERS, json=payload, timeout=timeout)
         response.raise_for_status()
@@ -415,7 +466,7 @@ def extract_answer(payload):
 
 def generate(user_prompt, memory, config):
     
-    #Fecha y hora actual
+    # --- FECHA ACTUAL ---
     current_date = datetime.datetime.now().strftime("%Y-%m-%d")
     date_info = f"hoy es {current_date}."
     
@@ -440,29 +491,48 @@ def generate(user_prompt, memory, config):
             + "\n---\n".join(relevant_kb[:2])
         )
 
-    # Ajustar prompt si necesita respuesta larga
     final_prompt = split_response_if_needed(final_prompt, config)
+
+    if should_search(user_prompt, memory, config):
+        print(f"\n🔍 [Loji] Buscando información actualizada...")
+        search_results = duckduckgo_search(user_prompt, config)
+        
+        if search_results and "No encontré" not in search_results[0] and "Error" not in search_results[0]:
+            # Agregar resultados al prompt
+            search_text = "\n".join(search_results[:3])  # Top 3 resultados
+            final_prompt += f"\n\n[DATOS DE BÚSQUEDA ACTUAL]:\n{search_text}"
+            print(f"✅ Encontrados {len(search_results)} resultados")
+            
+            # Guardar en KB para futuras consultas
+            add_to_knowledge_base({
+                "query": user_prompt,
+                "content": search_text,
+                "sources": search_results,
+                "timestamp": time.time()
+            }, config)
+        else:
+            print(f"⚠️  No se encontró información actualizada")
 
     # --- IMÁGENES CON OCR REAL ---
     image_urls = extract_image_urls(user_prompt)
     
     if image_urls and config.get("vision_enabled", True):
-        print(f"\n[Loji] Detecté imagen: {image_urls[0][:50]}...")
+        print(f"\n🔍 [Loji] Detecté imagen: {image_urls[0][:50]}...")
         
         # EXTRAER TEXTO REAL CON OCR
         ocr_result = extract_text_from_image_url(image_urls[0])
         
         if not ocr_result.startswith("[Error") and not ocr_result.startswith("[La imagen"):
-            #  TEXTO EXTRAÍDO CON ÉXITO
+            #TEXTO EXTRAÍDO CON ÉXITO
             final_prompt += f"\n\n[TEXTO EXTRAÍDO DE LA IMAGEN]:\n{ocr_result}"
-            print(f" Texto extraído ({len(ocr_result)} caracteres)")
+            print(f"✅ Texto extraído ({len(ocr_result)} caracteres)")
             
             # Reemplazar URL por marcador
             final_prompt = final_prompt.replace(image_urls[0], "[IMAGEN]")
         else:
-            #  OCR FALLÓ
+            #OCR FALLÓ
             final_prompt += f"\n\n[Imagen detectada pero no contiene texto legible]"
-            print(f"Error en {ocr_result}")
+            print(f"⚠️  {ocr_result}")
     
     # Calcular tokens dinámicos
     base_tokens = config.get("max_tokens", 350)
@@ -478,7 +548,7 @@ def generate(user_prompt, memory, config):
     payload = {
         "model": config.get("model_name", "local-model"),
         "messages": messages,
-        "max_tokens": max_tokens_adjusted,  #  Ahora es dinámico
+        "max_tokens": max_tokens_adjusted,  # ✅ Ahora es dinámico
         "temperature": config.get("temperature", 0.7),
         "stream": False
     }
@@ -491,9 +561,9 @@ def generate(user_prompt, memory, config):
     if not answer:
         return "No pude generar una respuesta."
 
-    #Detectar y marcar truncamiento
+     # Detectar y marcar truncamiento
     if config.get("enable_smart_continuation", True) and detect_truncation(answer):
-        answer += "\n\n *[Respuesta extensa. Escribí 'seguí' o 'continúa' para ver más detalles]*"
+        answer += "\n\n💬 *[Respuesta extensa. Escribí 'seguí' o 'continúa' para ver más detalles]*"
 
     memory.append({"role": "user", "content": user_prompt})
     memory.append({"role": "assistant", "content": answer})
@@ -503,17 +573,18 @@ def generate(user_prompt, memory, config):
 
 def loji_console():
     print("=" * 60)
-    print("Loji 1.5.1 - Asistente IA local")
+    print("Loji 1.5.2 - Asistente IA Optimizado")
+    print("Created by Emiliano Cabella - Universidad del Comahue")
     print("=" * 60)
     print("Escribe '/help' para ver comandos disponibles.\n")
     
     config = load_settings()
     memory = load_config() + load_memory()
     
-    #  Solo un hilo de actualización
+    #Se actualiza en un solo hilo 
     update_thread = threading.Thread(target=periodic_update, args=(config,), daemon=True)
     update_thread.start()
-    print(" Hilo de actualización automática iniciado.\n")
+    print("Hilo de actualización automática iniciado.\n")
 
     def print_help():
         print(
@@ -548,9 +619,9 @@ def loji_console():
         print(f"Búsquedas en caché: {cache_size}")
         print(f"Max tokens configurado: {config.get('max_tokens', 350)}")
         print(f"Temperature: {config.get('temperature', 0.6)}")
-        print(f"Visión (OCR): {'Activado' if config.get('vision_enabled') else 'Desactivado'}")
-        print(f"Tokens dinámicos: {'Activado' if config.get('dynamic_tokens') else 'Desactivado'}")
-        print(f"Continuación inteligente: {'Activado' if config.get('enable_smart_continuation') else 'Desactivado'}")
+        print(f"Visión (OCR): {'Activado' if config.get('vision_enabled') else '❌ Desactivado'}")
+        print(f"Tokens dinámicos: {'Activado' if config.get('dynamic_tokens') else '❌ Desactivado'}")
+        print(f"Continuación inteligente: {'Activado' if config.get('enable_smart_continuation') else '❌ Desactivado'}")
         print("=" * 60 + "\n")
 
     while True:
@@ -564,7 +635,7 @@ def loji_console():
             continue
             
         if user_input.lower() == "/exit":
-            print("Loji: ¡Hasta luego! 👋")
+            print("Loji: ¡Hasta luego!")
             break
             
         if user_input.lower() == "/clear":
@@ -593,7 +664,7 @@ def loji_console():
             print(f"Loji: Tokens dinámicos {status}.\n")
             continue
             
-        # Comando para activar/desactivar continuación
+        # Comando para activar/desactivar continuación inteligente
         if user_input.lower().startswith("/continuation"):
             parts = user_input.split()
             if len(parts) != 2 or parts[1].lower() not in ["on", "off"]:
@@ -654,7 +725,7 @@ def loji_console():
                 print("Loji: Usa '/refresh <tema>'.\n")
                 continue
             topic = parts[1].strip()
-            print(f"🔍 Buscando: {topic}...")
+            print(f"Buscando: {topic}...")
             results = duckduckgo_search(topic, config, force_refresh=True)
             if results and "No encontré" not in results[0]:
                 entry = {
@@ -687,10 +758,10 @@ def loji_console():
                 print("Loji: Por favor, usa '/rate buena' o '/rate mala'.\n")
             continue
         
-        # Comando para continuar respuestas anteriores
+        #Comando para continuar respuestas anteriores
         if user_input.lower() in ["seguí", "continua", "continúa", "sigue", "continuar", "más"]:
             if memory and len(memory) >= 2 and memory[-1]["role"] == "assistant":
-                print("🔄 Continuando respuesta anterior...\n")
+                print("Continuando respuesta anterior...\n")
                 continuation_prompt = "Continuá tu respuesta anterior donde la dejaste, desarrollando más el tema."
                 reply = generate(continuation_prompt, memory, config)
                 print(f"Loji: {reply}\n")
